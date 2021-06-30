@@ -1,0 +1,726 @@
+---
+title: "Wrangling FIA and Climate Data"
+output: html_notebook
+---
+
+Libraries:
+
+```{r, warning = FALSE, message = FALSE}
+library(rFIA)
+library(dplyr)
+library(ggplot2)
+library(rpart)
+library(mgcv)
+library(tidyr)
+library(RNetCDF)
+library(tidync)
+library(ncmeta)
+library(dplyr)
+library(ggplot2)
+library(tools)
+library(sf)
+library(maps)
+library(patchwork)
+```
+
+
+
+## Determine top 10 most abundant trees in CO:
+
+Load in Forest data and join `TREE` and `PLOT` tables:
+
+(he `TREE` table contains a good deal of the relevant information regarding the trees in a plot area. We also may want to look at other tables too, which may contain relevant information. In order to get the location (in geographic coordinates) of a plot, this table must be joined with `PLOT` table where the `PLT_CN` is a foreign key linking the tables together. As we can see, there are over 200 different variables in the `TREE` table.))
+
+```{r}
+## Object holding loaction of data
+COforest <- readFIA("C:/Users/jddru/Desktop/ASAENVR/data/co-fia")
+
+## Plot and Tree tables:
+CO.TREE <- COforest$TREE
+CO.PLOT <- COforest$PLOT
+
+## Wrangle and Join Tables
+CO.tree <- CO.TREE %>% select(
+  ## Grab ID and location/plot information...
+  CN, PLT_CN, INVYR, ##UNITCD, COUNTYCD, PLOT, SUBP, TREE, CONDID, AZIMUTH, DIST,
+  ## Relavent tree measurment...
+  STATUSCD, SPCD, DIA, DIAHTCD, HT, HTCD, CR, CCLCD)
+  ## Enviromental factors
+  ##AGENTCD, CULL, DECAYCD)
+
+CO.plot <- CO.PLOT %>% select(
+  ## Grab ID and location information..
+  CN, LAT, LON, ELEV
+)
+
+## Join the subsets of tables together
+
+CO.forest <- full_join(CO.tree, CO.plot, by = c("PLT_CN" = "CN"))
+head(CO.forest)
+```
+
+
+Let's count the number of species of trees in Colorado and see which are the most prevalent:
+
+```{r}
+CO.forest %>% filter(INVYR>=2002 & STATUSCD == 1) %>% 
+  count(SPCD, sort = TRUE) %>% 
+  mutate(percent = round(100 * n / sum(n),3))
+```
+
+
+Looking at the top 10 trees by valsuantity, we have:
+
+  1) 746 is valsuaking aspen (my favorite),
+  2) 93 Engelmann spruce,
+  3) 108 lodgepole pine,
+  4) 814 Gambel oak,
+  5) 19 subalpine fir
+  6) 106 Common or two-needle pinion
+  7) 65 Utah Juniper
+  8) 202 Douglas-fir
+  9) 122 Ponderosa Pine
+  10) 18 Corkbark fir
+  
+Let's filter by these 10 species:
+
+```{r}
+spcd.id <- c(746,93,108,814,19,106,65,202,122,18)
+CO.forestSub <- CO.forest %>% filter(SPCD %in% spcd.id)
+head(CO.forestSub) 
+```
+
+Get plot ID for live trees (`STATUSCD` = 1) from 2002 and beyond:
+
+```{r}
+#CO.TreeBin <- CO.forestSub %>%
+  # mutate(value = 1) %>%
+  # pivot_wider(names_from = SPCD,
+  #             values_from = value,
+  #             values_fill = list(value = 0),
+  #             names_prefix = "SPCD") %>%
+  ##mutate(value = 1) %>% spread(key = SPCD, value, fill = 0) %>%
+  #filter(INVYR >= 2002 & STATUSCD == 1) %>%
+  #select(-c(CN))
+
+CO.TreeBin <- CO.forestSub %>%
+  filter(INVYR >= 2002 & STATUSCD == 1) %>%
+  select(PLT_CN, INVYR, LAT, LON, ELEV, SPCD) %>%
+  mutate(SPCD = factor(SPCD)) %>%
+  group_by(PLT_CN, LAT, LON, ELEV, SPCD) %>%
+  summarise(species_count =  n()) %>%
+  pivot_wider(names_from = SPCD,
+              values_from = species_count,
+              values_fill = list(species_count = 0),
+              names_prefix = 'SPCD_') %>%
+  ungroup()
+
+
+
+head(CO.TreeBin)
+```
+
+
+
+Plot locations with no observations:
+
+```{r}
+no.obs <- CO.forest %>% filter((CN %in% CO.TreeBin$PLT_CN) == FALSE &
+                                 is.na(INVYR) == TRUE)
+```
+
+
+## Soils data
+
+Read into R:
+```{r}
+soil.lab <- read.csv("C:/Users/jddru/Desktop/ASAENVR/data/co-fia/CO_SOILS_LAB.csv", header = TRUE)
+soil.loc <- read.csv("C:/Users/jddru/Desktop/ASAENVR/data/co-fia/CO_SOILS_SAMPLE_LOC.csv", header = TRUE)
+
+soil.lab.summary <- soil.lab %>%
+  group_by(CN, PLT_CN, STATECD, COUNTYCD, PLOT) %>%
+  summarise_at(vars(FIELD_MOIST_SOIL_WT:OLSEN_P), mean)
+
+
+soil.geo <- inner_join(CO.TreeBin, soil.lab.summary)
+
+ggplot(soil.geo, aes(x = LON, y = LAT)) +
+  geom_point()
+
+naniar::vis_miss(soil.lab.summary, warn_large_data = FALSE)
+```
+Remove the mineral measurements due the missing data.
+
+```{r}
+soil.geo.sub <- soil.geo %>%
+  select(PLT_CN, LON, LAT, FIELD_MOIST_SOIL_WT, OVEN_DRY_SOIL_WT, TOTAL_WATER_CONTENT_PCT,
+         BULK_DENSITY, C_ORG_PCT, C_INORG_PCT, C_TOTAL_PCT, N_TOTAL_PCT) %>%
+  mutate(C_INORG_PCT = C_TOTAL_PCT-C_ORG_PCT) %>%
+  na.omit() %>%
+  group_by(PLT_CN, LON, LAT) %>%
+  summarise_all(mean)
+
+
+naniar::vis_miss(soil.geo.sub, warn_large_data = FALSE)
+```
+
+Get the texture measurements at the locations:
+```{r}
+## Select appropriate columns
+soil.loc.sub <- soil.loc %>%
+  filter(SOILS_STATCD == 1) %>%
+  select(PLT_CN, FORFLTHK, LTRLRTHK, CONDID, TXTRLYR1, TXTRLYR2, DPTHSBSL) %>%
+  mutate(DPTHSBSL = replace(DPTHSBSL, DPTHSBSL==99.9,0)) %>%
+  na.omit() %>%
+  group_by(PLT_CN,TXTRLYR1,TXTRLYR2) %>%
+  summarise_all(mean) %>%
+  mutate(TXTRLYR1 = factor(TXTRLYR1),
+         TXTRLYR2 = factor(TXTRLYR2))
+  
+
+naniar::vis_miss(soil.loc.sub, warn_large_data = FALSE)
+```
+
+
+Join:
+
+```{r}
+soils.df <- inner_join(soil.geo.sub,soil.loc.sub) 
+
+naniar::vis_miss(soils.df, warn_large_data = FALSE)
+```
+
+Look at the summary of the combined soils data:
+
+```{r}
+summary(soils.df)
+```
+
+Plot the soil locations in black, and the tree plot locations in red:
+
+```{r}
+ggplot(data = CO.TreeBin, aes(x = LON, y = LAT)) +
+  geom_point(color = "red") +
+  geom_point(data = soils.df, aes(x = LON, y = LAT))
+```
+
+Interpolate the soil data with KNN k=1 interpolation. Based on the latitude and longitude coordinates of a tree plot location, we will find the nearest soil plot and obtain the plot ID:
+
+```{r}
+tree.locs <- data.frame(CO.TreeBin %>% select(c(PLT_CN,LON,LAT)))
+tree.locs <- tree.locs[,2:3]
+soil.locs <- soils.df %>% select(c(PLT_CN,LON,LAT)) %>% as.data.frame()
+soil.coords <- soil.locs[,2:3]
+soil.cs <- factor(soil.locs[,1])
+
+soil.interp <- class::knn(soil.coords, 
+                          tree.locs,
+                          soil.cs, 
+                          k = 1)
+```
+
+
+Add soil plot column:
+
+```{r}
+CO.TreeBin$SOIL_PLT_CN = as.numeric(as.character(soil.interp))
+
+head(CO.TreeBin)
+```
+
+Join soil data by soil plot ID:
+
+```{r}
+CO.TreeBinSoil <- inner_join(CO.TreeBin, soils.df, by = c("SOIL_PLT_CN" = "PLT_CN")) %>%
+  select(-c(LON.y, LAT.y)) %>%
+  rename(LAT = LAT.x, LON = LON.x)
+
+head(CO.TreeBinSoil)
+```
+
+valsuick plot to check that things make sense:
+
+```{r}
+ggplot(data = CO.TreeBinSoil, aes(x = LON, y = LAT, color = C_ORG_PCT)) +
+  geom_point()
+```
+
+## Climate Data
+
+Set file paths do data:
+
+```{r}
+file.maxt <- "C:/Users/jddru/Desktop/ASAENVR/data/era-interim/MAXT.nc" # Maximum temperature
+file.mint <- "C:/Users/jddru/Desktop/ASAENVR/data/era-interim/MINT.nc" # Minimum temperature
+file.prec <- "C:/Users/jddru/Desktop/ASAENVR/data/era-interim/PREC.nc" # Precipitation
+
+##source('C:/Users/jddru/Desktop/ASAENVR/Colorado_Forests/load_netcdf.R')
+```
+
+Functions to get the data from the netCDF file:
+
+```{r}
+## function to get the data
+
+getCDF.data <- function(filePath, lonRange, latRange, timeRange){
+  
+  ## values for selecting a lat/long range and a time
+  
+  vals <- t(data.frame(lon = lonRange, 
+                    lat = latRange, 
+                    tim = timeRange, 
+                    row.names = c("min", "max")))
+  
+  ## Load the file
+  
+  df.out <- tidync(filePath)
+  
+  ## Get subset based on lon/lat and time specifications, return what's below
+  
+  df.out %>% hyper_filter(lon = between(lon, vals["lon", "min"], vals["lon", "max"]), 
+                          lat = between(lat, vals["lat", "min"], vals["lat", "max"]), 
+                           time = between(time, vals["tim", "min"], vals["tim", "max"])) %>% 
+    hyper_tibble()
+
+}
+
+## function to get the times
+
+ParseNetCDFTime <- function(variableMetadata, variableData) {
+  
+  ## get the time units from metatdata
+  time.unit <- nc_atts(variableMetadata, "time") %>% 
+    unnest(cols = c(value)) %>% 
+    filter(name == "units")
+  
+  ## get the time parts and return what's below
+  time.parts <- utcal.nc(time.unit$value, variableData$time)
+  ISOdatetime(time.parts[, "year"],
+              time.parts[, "month"],
+              time.parts[, "day"],
+              time.parts[, "hour"],
+              time.parts[, "minute"],
+              time.parts[, "second"],
+              tz = "UTC")
+}
+```
+
+
+We need to get human-usable times for aggregation and filtering, this needs to be done in a slightly round-about-way to avoid memory issues. (Thus far, I haven't thought of a more elegant way of doing this with our current NETCDF infrastructure.) First let's grab a time series at a location in order to get a mapping from the date index to an actual date:
+
+```{r}
+## Grab series
+era.ts <- getCDF.data(filePath = file.maxt, 
+                       lonRange = c(255,255), 
+                       latRange = c(40.5,40.5), 
+                       timeRange = c(0,14245))
+
+## Convert the time index to date and drop unnecessary cols
+era.ts <- era.ts %>% 
+  mutate(date = ParseNetCDFTime(file.maxt, era.ts)) %>% 
+  select(-(MAXT)) %>% 
+  select(-(lon)) %>% 
+  select(-(lat))
+
+## Parse the date to year, month, date for filtering/aggregation
+era.ts <- era.ts %>% mutate(year = lubridate::year(date),
+                            month = lubridate::month(date),
+                            day = lubridate::day(date))
+head(era.ts)
+```
+
+
+Now we have a mapping from the the time index to a date. In order to set the indies for the `getCDF.data` function, we'll need to find the time index corresponding to Jan 1 2002. Note that the climate data only goes up through the end of 2017, so we can drop the years 2018 and 2019 from the FIA table. We also need to set-up lat/lon bounds over Colorado, found via Google maps (with some padding):
+
+```{r}
+t.start <- as.numeric(era.ts %>% filter(year == 1979, month == 1, day == 1) %>% 
+                        select(time))
+t.end <- max(era.ts$time)
+
+lat.max <- 45
+lat.min <- 33
+
+lon.max <- 262.5
+lon.min <- 247.75
+```
+
+Now let's grab the subset of the ERA-Interim climate data:
+
+```{r}
+maxt.df <- getCDF.data(filePath = file.maxt, 
+                       lonRange = c(lon.min,lon.max), 
+                       latRange = c(lat.min,lat.max), 
+                       timeRange = c(t.start,t.end))
+mint.df <- getCDF.data(filePath = file.mint, 
+                       lonRange = c(lon.min,lon.max), 
+                       latRange = c(lat.min,lat.max), 
+                       timeRange = c(t.start,t.end))
+prec.df <- getCDF.data(filePath = file.prec, 
+                       lonRange = c(lon.min,lon.max), 
+                       latRange = c(lat.min,lat.max), 
+                       timeRange = c(t.start,t.end))
+```
+
+Now, let's join the date table to each of these so we can aggregate/filter:
+
+```{r}
+maxt.df <- inner_join(maxt.df, era.ts, by = "time")
+mint.df <- inner_join(mint.df, era.ts, by = "time")
+prec.df <- inner_join(prec.df, era.ts, by = "time")
+
+climate.df <- left_join(maxt.df, mint.df) %>% 
+  left_join(., prec.df) %>% 
+  mutate(date = ParseNetCDFTime(file.maxt, maxt.df)) %>% 
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date),
+         day = lubridate::day(date)) %>%
+  select(lon, lat, MAXT, MINT, PREC, year, month, day)
+
+head(climate.df)
+```
+
+
+Let's obtain the following explanatory variables:
+
+* AVGT Mean annual temperature
+* JANT Mean January temperature
+* JULT Mean July temperature
+* PPT Annual precipitation
+* VARH Variance of high temperature
+* VARL Variance of low temperature
+* VARP Variance of precipitation
+
+
+Main climate variables:
+
+```{r}
+## Average temperature
+temp.avg <- climate.df %>% 
+  group_by(lon, lat) %>%
+  summarise(AVGT = mean((MAXT + MINT)/ 2 ))
+
+## Average January/February temperature
+temp.janAvg <- climate.df %>%
+  filter(month %in% c(1,2)) %>%
+  group_by(lon, lat) %>%
+  summarise(JANT = mean((MAXT + MINT)/2))
+
+## Average July/August temperature  
+temp.julyAvg <- climate.df %>%
+  filter(month %in% c(7,8)) %>%
+  group_by(lon, lat) %>%
+  summarise(JULT = mean((MAXT + MINT)/2))
+
+## Variation in mean summer temperature
+temp.varS <- climate.df %>%
+  filter(month %in% c(6,7,8)) %>%
+  group_by(lon,lat) %>%
+  summarise(VARS = var((MAXT + MINT)/2))
+
+## Variation in winter mean temperature
+temp.varW <- climate.df %>%
+  filter(month %in% c(1,2,12)) %>%
+  group_by(lon,lat) %>%
+  summarise(VARW = var((MAXT + MINT)/2))
+
+## Variation in annual mean temperature
+temp.varA <- climate.df %>%
+  group_by(lon,lat) %>%
+  summarise(VARA = var((MAXT + MINT)/2))
+
+## Difference in summer high and low temperature
+temp.diffS <- climate.df %>%
+  filter(month %in% c(6,7,8)) %>%
+  group_by(lon,lat) %>%
+  summarise(DIFS = mean(MAXT - MINT))
+
+## Difference in winter high and low temperature
+temp.diffW <- climate.df %>%
+  filter(month %in% c(1,2,12)) %>%
+  group_by(lon,lat) %>%
+  summarise(DIFW = mean(MAXT - MINT))
+
+## Annual cumulative precipitation
+temp.precAvg <- climate.df %>%
+  group_by(lon,lat) %>%
+  summarise(PPT = sum(PREC))
+
+## Summer cumulative precipitation
+temp.precS <- climate.df %>%
+  filter(month %in% c(6,7,8)) %>%
+  group_by(lon,lat) %>%
+  summarise(PPTS = sum(PREC))
+
+## Winter cumulative precipitation
+temp.precW <- climate.df %>%
+  filter(month %in% c(1,2,12)) %>%
+  group_by(lon,lat) %>%
+  summarise(PPTW = sum(PREC))
+
+## Annual precipitation variation
+temp.precvar <- climate.df %>%
+  group_by(lon,lat) %>%
+  summarise(VARP = var(PREC))
+
+climateSummary.df <- left_join(temp.avg,temp.janAvg) %>%
+  left_join(.,temp.julyAvg) %>%
+  left_join(., temp.precAvg) %>%
+  left_join(., temp.varS) %>%
+  left_join(., temp.varW) %>%
+  left_join(., temp.varA) %>%
+  left_join(., temp.diffS) %>%
+  left_join(., temp.diffW) %>%
+  left_join(., temp.varW) %>%
+  left_join(., temp.precAvg) %>%
+  left_join(., temp.precS) %>%
+  left_join(., temp.precW) %>%
+  left_join(., temp.precvar) 
+
+remove(temp.avg, temp.janAvg, temp.julyAvg, temp.precAvg, temp.highvar, temp.lowvar, temp.precvar)
+
+head(climateSummary.df)
+```
+
+Fit GAM models to smooth each of the variables for interpolation/prediction:
+
+```{r}
+gam.avgt <- gam(AVGT ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.jant <- gam(JANT ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML',data = climateSummary.df)
+gam.jult <- gam(JULT ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.ppt  <- gam(PPT  ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.vars <- gam(VARS ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.varw <- gam(VARW ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.vara <- gam(VARA ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.difs <- gam(DIFS ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.difw <- gam(DIFW ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.ppts <- gam(PPTS ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+gam.pptw <- gam(PPTW ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML',data = climateSummary.df)
+gam.varp <- gam(VARP ~ s(lon) + s(lat) + ti(lon, lat), method = 'REML', data = climateSummary.df)
+```
+
+Look at difference in summer temperature:
+
+```{r, fig.height = 4, fig.width = 10}
+par(mfrow = c(1,3))
+plot.gam(gam.difs, select = 1, residuals = TRUE, xlab = 'Longitude')
+plot.gam(gam.difs, select = 2, residuals = TRUE, xlab = 'Latitude')
+plot.gam(gam.difs, select = 3, residuals = TRUE, xlab = 'Longitude', ylab = 'Latitude')
+
+par(mfrow = c(2,2))
+gam.check(gam.difs)
+```
+Look at variation in precipitation:
+
+```{r, fig.height = 4, fig.width = 10}
+par(mfrow = c(1,3))
+plot(gam.vara, residuals = TRUE)
+
+par(mfrow = c(2,2))
+gam.check(gam.vara)
+```
+
+
+Predict climate variables at the plot locations and append to the soil+forest data-frame:
+
+```{r}
+CO.TreeBinSoilClimate <- CO.TreeBinSoil %>%
+  mutate(AVGT = predict(gam.avgt,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         JANT = predict(gam.jant,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         JULT = predict(gam.jult,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         PPT  = predict(gam.ppt,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         VARS = predict(gam.vars,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         VARW = predict(gam.varw,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         VARP = predict(gam.varp,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         VARA = predict(gam.vara,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         DIFS = predict(gam.difs,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)), 
+         DIFW = predict(gam.difw,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         PPTS = predict(gam.ppts,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         PPTW  = predict(gam.pptw,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         VARP  = predict(gam.varp,
+                        newdata = data.frame(lon = 360 + CO.TreeBinSoil$LON,
+                                             lat = CO.TreeBinSoil$LAT)),
+         )
+
+
+summary(CO.TreeBinSoilClimate)
+```
+
+
+Check temperature to make sure prediction was okay:
+
+```{r}
+ggplot(data = CO.TreeBinSoilClimate, aes(x = LON, y = LAT, color = scale(AVGT))) +
+  geom_point()
+```
+
+Write to a a csv for later or new notebook
+
+```{r}
+#write.csv(CO.TreeBinSoilClimate, "ForestClimate.csv")
+```
+
+
+
+Create a table for making predictions:
+
+We need to get elevation information, soil information, and climate information on a grid of longitude/latitude points. 
+
+Construct grid of Lat/Lon coordinates
+
+```{r}
+CO.plot.nona <- CO.plot %>% select(c(LON, LAT, ELEV)) 
+CO.plot.nona <- CO.plot.nona[-which(is.na(CO.plot$ELEV)),]
+
+lon.list <- seq(from = min(CO.plot.nona$LON),
+                to = max(CO.plot.nona$LON),
+                by = 0.01)
+lat.list <- seq(from = min(CO.plot.nona$LAT),
+                to = max(CO.plot.nona$LAT),
+                by = 0.01)
+coord.grid <- expand.grid(LON = lon.list, LAT = lat.list)
+paste("coord grid size: ", dim(coord.grid))
+head(coord.grid)
+```
+
+Use knn for nearest neighbor interpolation of elevation:
+
+```{r}
+elev.interp <- class::knn(CO.plot.nona %>% select(c(LON, LAT)), 
+                          coord.grid,
+                          CO.plot.nona$ELEV, 
+                          k = 1)
+coord.grid$ELEV <- as.numeric(as.character(elev.interp))
+head(coord.grid)
+```
+
+Check with a visual raster plot of the data:
+
+```{r}
+ggplot(data = coord.grid, aes(x = LON, y = LAT, fill = ELEV)) + 
+  geom_raster(interpolate = TRUE)
+```
+
+Using knn to interpolate the soil data as was done before, lets do the same:
+
+```{r}
+## Create the model interpolation
+soilGrid.interp <- class::knn(soil.coords,
+                              coord.grid[,c(1,2)],
+                              soil.cs)
+
+## Get the corresponding plot number for each lat/lon
+coord.grid <- coord.grid %>% 
+  mutate(SOIL_PLT_CN = 
+           as.numeric(as.character(soilGrid.interp)))
+
+## Join soil table with coordinate table
+coord.grid <- inner_join(coord.grid, soils.df, by = c("SOIL_PLT_CN" = "PLT_CN")) %>%
+  select(-c(LON.y, LAT.y)) %>%
+  rename(LON = LON.x, LAT = LAT.x)
+
+head(coord.grid)
+```
+
+Check with a visual raster plot of the data:
+
+```{r}
+ggplot(data = coord.grid, aes(x = LON, y = LAT, fill = N_TOTAL_PCT)) + 
+  geom_raster(interpolate = TRUE)+
+  scale_fill_continuous(low = "blue", high = "red")
+```
+
+
+Using the existing GAM climate smooths, we predict at the grid of LAT/LON locations:
+
+```{r}
+coord.grid <- coord.grid %>%
+  mutate(AVGT = predict(gam.avgt,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         JANT = predict(gam.jant,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         JULT = predict(gam.jult,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         PPT  = predict(gam.ppt,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         VARS = predict(gam.vars,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         VARW = predict(gam.varw,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         VARP = predict(gam.varp,
+                       newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         VARA = predict(gam.vara,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         DIFS = predict(gam.difs,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)), 
+         DIFW = predict(gam.difw,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         PPTS = predict(gam.ppts,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         PPTW  = predict(gam.pptw,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         VARP  = predict(gam.varp,
+                        newdata = data.frame(lon = 360 + coord.grid$LON,
+                                             lat = coord.grid$LAT)),
+         )
+summary(coord.grid)
+
+```
+
+
+
+```{r}
+ggplot(data = coord.grid, aes(x = LON, y = LAT, fill = PPTS)) + 
+  geom_raster(interpolate = TRUE)
+```
+
+Write the prediction grid to a csv file for later use:
+
+```{r}
+#write.csv(coord.grid, "prediction_grid.csv")
+```
+
+
+
+
+
+
+
+
+
+

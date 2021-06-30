@@ -1,0 +1,1224 @@
+---
+title: "FIA + Climate Analysis Notebook"
+output: html_notebook
+---
+
+Libraries:
+
+```{r, warning = F, message = F}
+library(tidyverse)
+library(caret)
+library(xgboost)
+```
+
+
+Read in the data:
+
+```{r}
+forest.df <- read.csv("ForestClimate.csv", header = TRUE)
+str(forest.df)
+```
+
+Recall:
+
+Looking at the top 10 trees by quantity, we have:
+
+  1) 746 is quaking aspen,
+  2) 93 Engelmann spruce,
+  3) 108 lodgepole pine,
+  4) 814 Gambel oak,
+  5) 19 subalpine fir
+
+
+Remove some of the identifier codes, turn species code into one-hot columns and re-scale the continuous variables:
+
+```{r}
+fst.df <- 
+forest.df %>%
+  
+  ## remove extra columns
+  select(-c(X, PLT_CN, 
+            SOIL_PLT_CN, OVEN_DRY_SOIL_WT, TOTAL_WATER_CONTENT_PCT,
+            C_ORG_PCT, C_INORG_PCT, TXTRLYR1, TXTRLYR2, 
+            CONDID, 
+            SPCD_202, SPCD_122, SPCD_65, SPCD_106, SPCD_18)) %>%
+  
+  ## rename species:
+  rename(SPCD_aspen = SPCD_746,
+         SPCD_spruce = SPCD_93,
+         SPCD_pine = SPCD_108,
+         SPCD_oak = SPCD_814,
+         SPCD_fir = SPCD_19) %>%
+  
+   # create dummy variables for the top 5 species
+   mutate(SPCD_aspen  = ifelse(SPCD_aspen  >= 1, 1, 0),
+          SPCD_spruce = ifelse(SPCD_spruce >= 1, 1, 0),
+          SPCD_pine   = ifelse(SPCD_pine   >= 1, 1, 0),
+          SPCD_oak    = ifelse(SPCD_oak    >= 1, 1, 0),
+          SPCD_fir    = ifelse(SPCD_fir    >= 1, 1, 0)) %>%
+  
+  # create elevation strata
+  mutate(ELEV = round(ELEV, -2)) %>%
+
+  ## re-scale continuous variables
+  mutate_at(vars(ELEV,FIELD_MOIST_SOIL_WT:PPTW), ~scale(.)) %>%
+  
+  ## drop na's
+  na.omit()
+
+head(fst.df)
+```
+
+Import and re-scale the prediction grid data by the mean and standard deviation of the original data:
+
+```{r}
+pred.grid <- read.csv("prediction_grid.csv", header = TRUE) %>% 
+  select(-c(X, SOIL_PLT_CN,OVEN_DRY_SOIL_WT, TOTAL_WATER_CONTENT_PCT,
+            C_ORG_PCT, C_INORG_PCT, TXTRLYR1, TXTRLYR2, TXTRLYR1, TXTRLYR2, CONDID))
+
+pred.grid <- pred.grid %>%
+  mutate( 
+         ELEV = (ELEV - mean(forest.df$ELEV))/sd(forest.df$ELEV),
+         
+         ## SOIL VARIABLES
+         FIELD_MOIST_SOIL_WT = (FIELD_MOIST_SOIL_WT - mean(forest.df$FIELD_MOIST_SOIL_WT)) / sd(forest.df$FIELD_MOIST_SOIL_WT),
+         
+         BULK_DENSITY = (BULK_DENSITY - mean(forest.df$BULK_DENSITY)) / sd(forest.df$BULK_DENSITY),
+         
+         C_TOTAL_PCT = (C_TOTAL_PCT - mean(forest.df$C_TOTAL_PCT)) / sd(forest.df$C_TOTAL_PCT),
+         N_TOTAL_PCT = (N_TOTAL_PCT - mean(forest.df$N_TOTAL_PCT)) / sd(forest.df$N_TOTAL_PCT),
+         
+         FORFLTHK = (FORFLTHK - mean(forest.df$FORFLTHK)) / sd(forest.df$FORFLTHK),
+         LTRLRTHK = (LTRLRTHK - mean(forest.df$LTRLRTHK)) / sd(forest.df$LTRLRTHK),
+         DPTHSBSL = (DPTHSBSL - mean(forest.df$DPTHSBSL)) / sd(forest.df$DPTHSBSL),
+         
+         ## CLIMATE VARIBLES
+         AVGT = (AVGT - mean(forest.df$AVGT)) / sd(forest.df$AVGT),
+         JANT = (JANT - mean(forest.df$JANT)) / sd(forest.df$JANT),
+         JULT = (JULT - mean(forest.df$JULT)) / sd(forest.df$JULT),
+         PPT  = (PPT  - mean(forest.df$PPT )) / sd(forest.df$PPT),
+         VARS = (VARS - mean(forest.df$VARS)) / sd(forest.df$VARS),
+         VARW = (VARW - mean(forest.df$VARW)) / sd(forest.df$VARW),
+         VARA = (VARA - mean(forest.df$VARA)) / sd(forest.df$VARA),
+         DIFS = (DIFS - mean(forest.df$DIFS)) / sd(forest.df$DIFS),
+         DIFW = (DIFW - mean(forest.df$DIFW)) / sd(forest.df$DIFW),
+         PPTS = (PPTS - mean(forest.df$PPTS)) / sd(forest.df$PPTS),
+         PPTW = (PPTW - mean(forest.df$PPTW)) / sd(forest.df$PPTW))
+
+head(pred.grid)        
+```
+
+Create data matrices for boosting:
+
+```{r}
+## split fst.df into a training and testing set
+set.seed(321)
+num.obs <- dim(fst.df)[1]
+split.pct <- 0.8
+trn.index <- sample(1:num.obs, round(split.pct*num.obs))
+
+fst.train <- as.data.frame(fst.df[ trn.index,])
+fst.test  <- as.data.frame(fst.df[-trn.index,])
+
+## create xgb.Dmatrix objects for testing and training each of the species:
+
+## ASPENS
+
+XGaspen.trn <- xgb.DMatrix(data  = as.matrix(fst.train %>% 
+                                               select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.train$SPCD_aspen))
+
+XGaspen.tst <- xgb.DMatrix(data  = as.matrix(fst.test %>% 
+                                               select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.test$SPCD_aspen))
+
+XGaspen.full <- xgb.DMatrix(data = as.matrix(fst.df %>% select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.df$SPCD_aspen))
+
+
+## ENGELMANN SPRUCE
+
+XGspruce.trn <- xgb.DMatrix(data  = as.matrix(fst.train %>% 
+                                                select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.train$SPCD_spruce))
+
+XGspruce.tst <- xgb.DMatrix(data  = as.matrix(fst.test %>% 
+                                                select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.test$SPCD_spruce))
+
+XGspruce.full <- xgb.DMatrix(data = as.matrix(fst.df %>% 
+                                                select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label  = as.matrix(fst.df$SPCD_spruce))
+
+
+## LODGEPOLE PINE
+
+XGpine.trn <- xgb.DMatrix(data  = as.matrix(fst.train %>% 
+                                              select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.train$SPCD_pine))
+
+XGpine.tst <- xgb.DMatrix(data  = as.matrix(fst.test %>% 
+                                              select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.test$SPCD_pine))
+
+XGpine.full <- xgb.DMatrix(data  = as.matrix(fst.df %>% 
+                                               select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label  = as.matrix(fst.df$SPCD_pine))
+
+## GAMBEL OAK
+
+XGoak.trn <- xgb.DMatrix(data  = as.matrix(fst.train %>% 
+                                             select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.train$SPCD_oak))
+XGoak.tst <- xgb.DMatrix(data  = as.matrix(fst.test %>% 
+                                             select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.test$SPCD_oak))
+
+XGoak.full <- xgb.DMatrix(data  = as.matrix(fst.df %>% 
+                                              select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label  = as.matrix(fst.df$SPCD_oak))
+
+
+## DOUGLAS FIR
+
+XGfir.trn <- xgb.DMatrix(data  = as.matrix(fst.train %>% 
+                                             select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.train$SPCD_fir))
+
+XGfir.tst <- xgb.DMatrix(data  = as.matrix(fst.test %>% 
+                                             select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label = as.matrix(fst.test$SPCD_fir))
+
+XGfir.full <- xgb.DMatrix(data  = as.matrix(fst.df %>% 
+                                              select(ELEV,FIELD_MOIST_SOIL_WT:PPTW)),
+                           label  = as.matrix(fst.df$SPCD_fir))
+
+
+## GRID for PREDICTIONS
+
+XG.predGrid <- xgb.DMatrix(data = as.matrix(pred.grid %>% select(-c(LON,LAT))))
+
+```
+
+
+Helper functions to determine the optimum depth and learning rate of XGBoosting for a fixed number of rounds using the precision-recall AUC metric.
+
+```{r}
+xg.optimize <- function(XG.trn, depth.seq, eta.seq, nround = 10, cv.folds = 10, resp.type = "binary:logistic"){
+  
+  ## create search grid
+  search.grid <- cbind(expand.grid(depth = depth.seq, 
+                                   eta = eta.seq),
+                       train.auc = 1:(length(depth.seq)*length(eta.seq)),
+                       test.auc = 1:(length(depth.seq)*length(eta.seq)))
+  
+  ## begin iterations
+  for (i in 1:dim(search.grid)[1]){
+    
+    ## use xg cross-validation function 
+    t <- xgb.cv(data = XG.trn,
+                
+                ## Paramaters to be optimized
+                max.depth = search.grid$depth[i], 
+                eta = search.grid$eta[i],
+                
+                ## folds and rounds
+                nfold = cv.folds,
+                nrounds = nround,
+                
+                ## control over fitting
+                max_delta_step = 2,
+                scale_pos_weight = 1.5,
+                subsample = 0.8,
+                
+                ## objective to optimize
+                stratified = TRUE,
+                metrics = "auc",
+                objective = resp.type,
+              
+                ## quiet output
+                verbose = 0)
+    
+    ## put auc value in the search grid
+    result.train <- t$evaluation_log$train_auc_mean
+    result.test <- t$evaluation_log$test_auc_mean
+
+    search.grid$train.auc[i] <- result.train[length(result.train)]
+    search.grid$test.auc[i] <- result.test[length(result.test)]
+    
+    print(paste("Iteration #: ", i))
+    
+    }
+  
+  ## return search values
+  return(search.grid)
+
+}
+
+# xg.tune_rounds <- function(XG.trn, XG.val, depth, eta, nround, early.stop, cv.folds = 10) {
+#    t <- xgb.cv(data = XG.trn,
+#                 max.depth = depth, 
+#                 eta = eta,
+#                 nfold = cv.folds,
+#                 nrounds = nround,
+#                 subsample = 0.75,
+#                 ## control over fitting
+#                 max_delta_step = 2,
+#                 scale_pos_weight = 0.8,
+#                 metrics = "aucpr",
+#                 objective = "binary:logistic",
+#                 
+#                 ## watches to stop 
+#                 watchlist = list(train = XG.trn, val = XG.val),
+#                 early_stopping_rounds = early.stop)
+#    
+#    return(t)
+#   
+# }
+# 
+# ## get best value
+# 
+# xg.param <- function(df){
+#     
+#   auc.test.max <- max(df$test.auc)
+#   best.index <- which(df$test.auc == auc.test.max)
+#   train.auc <- df$train.auc[best.index]
+#   best.depth <- df$depth[best.index]
+#   best.eta <- df$eta[best.index]
+#   
+#   return.df <- data.frame(auc.test = auc.test.max,
+#                           train.auc = train.auc,
+#                           depth = best.depth,
+#                           eta = best.eta)
+#   
+#   ## return hyper-parameters and auc
+#   return(return.df)
+#   
+# }
+
+```
+
+
+## Optimize hyper-parameters for the tree species
+
+Get best hyper parameters for each of the tree species using a (non-exhaustive) grid search:
+
+```{r, eval = F}
+set.seed(43)
+depth.vals <- c(3,4,6,8,10)
+eta.vals   <- c(0.1,0.3,0.5,1) #10^seq(-2, 1.5, length = 6)
+
+aspen.optim <- xg.optimize(XG.trn = XGaspen.trn,
+                           cv.folds = 10,
+                           depth.seq = depth.vals,
+                           eta.seq = eta.vals)
+
+spruce.optim <- xg.optimize(XG.trn = XGspruce.trn,
+                            cv.folds = 10,
+                            depth.seq = depth.vals,
+                            eta.seq = eta.vals)
+
+pine.optim <- xg.optimize(XG.trn = XGpine.trn,
+                          cv.folds = 10,
+                          depth.seq = depth.vals,
+                          eta.seq = eta.vals)
+
+oak.optim <- xg.optimize(XG.trn = XGoak.trn,
+                         cv.folds = 10,
+                         depth.seq = depth.vals,
+                         eta.seq = eta.vals)
+
+fir.optim <- xg.optimize(XG.trn = XGfir.trn,
+                         cv.folds = 10,
+                         depth.seq = depth.vals,
+                         eta.seq = eta.vals)
+
+aspen.optim
+spruce.optim
+pine.optim
+oak.optim
+fir.optim
+```
+* Aspen: depth = 4, eta = 0.3
+* Spruce : depth = 3, eta = 0.3
+* Pine: depth = 3, eta = 0.5
+* Oak: depth = 3, eath = 0.3
+* Fir: depth = 3, eta = 0.3
+
+
+Generally, the tendency is to over-fit the data.
+
+
+
+## Examining Aspen Predictions
+
+Model fitting and prediction accuracy:
+
+```{r}
+xg.aspen <- xgboost(data = XGaspen.trn,
+                    max.depth = 4, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    
+                    ## control over fitting
+                    max_delta_step = 2,
+                    scale_pos_weight = 1.5,
+                    
+                    objective = "binary:logistic")
+
+xg.yhat.trn <- predict(xg.aspen, newdata = XGaspen.trn, type = "response")
+xg.yhat.trn <- as.numeric(xg.yhat.trn >= 0.5)
+
+xg.yhat <- predict(xg.aspen, newdata = XGaspen.tst, type = "response")
+xg.yhat <- as.numeric(xg.yhat >= 0.5)
+
+mean(xg.yhat == fst.test$SPCD_aspen)
+mean(xg.yhat.trn == fst.train$SPCD_aspen)
+
+MLmetrics::F1_Score(factor(xg.yhat), factor(fst.test$SPCD_aspen))
+MLmetrics::F1_Score(factor(xg.yhat.trn), factor(fst.train$SPCD_aspen))
+```
+
+Make a spatial/map plot:
+
+```{r}
+## Prediction on full data
+xgF.aspen <- xgboost(data = XGaspen.full,
+                    max.depth = 4, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    
+                    ## control over fitting
+                    max_delta_step = 2,
+                    scale_pos_weight = 0.8,
+                    
+                    objective = "binary:logistic")
+
+## Make predictions on the prediction grid
+aspen.preds <- predict(xgF.aspen, newdata = XG.predGrid, type = response)
+
+aspen.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(aspen.preds = ifelse(aspen.preds > 0.5, 1, 0))
+
+
+aspen.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_aspen) %>%
+  mutate(SPCD_aspen = factor(SPCD_aspen))
+
+
+aspen.plot <- 
+ggplot(data = aspen.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = aspen.preds), interpolate = TRUE) +
+  scale_fill_gradient(low= "white", high="darkgreen", guide = 'none') +
+  geom_point(data = aspen.pts, aes(x = LON, y = LAT, color = SPCD_aspen),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1))+
+  ggtitle('Predicted Quaking Aspen Distribution')
+  
+aspen.plot
+```
+
+
+Get a list of variable importance:
+
+```{r}
+xgb.importance(model = xg.aspen)
+```
+
+## Examining Spruce Predictions:
+
+
+Fit a model and make predictions:
+
+
+
+Model fitting and prediction accuracy:
+
+```{r}
+xg.spruce <- xgboost(data = XGspruce.trn,
+                     max.depth = 3, 
+                     eta = 0.3,
+                     nrounds = 10,
+                     ## control over fitting
+                     max_delta_step = 2,
+                     scale_pos_weight = 1.5,
+                     objective = "binary:logistic")
+
+xg.yhat.trn <- predict(xg.spruce, newdata = XGspruce.trn, type = "response")
+xg.yhat.trn <- as.numeric(xg.yhat.trn > 0.35)
+
+xg.yhat <- predict(xg.spruce, newdata = XGspruce.tst, type = "response")
+xg.yhat <- as.numeric(xg.yhat > 0.35)
+
+mean(xg.yhat == fst.test$SPCD_spruce)
+mean(xg.yhat.trn == fst.train$SPCD_spruce)
+
+MLmetrics::F1_Score(factor(xg.yhat), factor(fst.test$SPCD_spruce))
+MLmetrics::F1_Score(factor(xg.yhat.trn), factor(fst.train$SPCD_spruce))
+```
+
+Plot predictions:
+
+```{r}
+xg.spruce <- xgboost(data = XGspruce.full,
+                    max.depth = 3, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    
+                    ## control over fitting
+                    max_delta_step = 2,
+                    scale_pos_weight = 1.5,
+                    
+                    objective = "binary:logistic")
+
+## Make predictions on the prediction grid
+spruce.preds <- predict(xg.spruce, newdata = XG.predGrid, type = response)
+
+spruce.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(spruce.preds = ifelse(spruce.preds>0.35,1,0))
+
+
+spruce.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_spruce) %>%
+  mutate(SPCD_spruce = factor(SPCD_spruce))
+
+spruce.plot <- 
+ggplot(data = spruce.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = spruce.preds), interpolate = TRUE) +
+  scale_fill_gradient(low= "white", high="darkgreen", guide = 'none') +
+  geom_point(data = spruce.pts, aes(x = LON, y = LAT, color = SPCD_spruce),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle("Predicted Engelmann Spruce Distribution")
+
+spruce.plot
+```
+
+Get a list of variable importance:
+
+```{r}
+xgb.importance(model = xg.spruce)
+```
+
+## Examining Pine
+
+
+Model fitting and prediction accuracy:
+
+```{r}
+xg.pine <- xgboost(data = XGpine.trn,
+                    max.depth = 3, 
+                    eta = 0.5,
+                    nrounds = 10,
+                    ## control over fitting
+                    max_delta_step = 2,
+                    scale_pos_weight = 1.5,
+                    objective = "binary:logistic")
+
+xg.yhat.trn <- predict(xg.pine, newdata = XGpine.trn, type = "response")
+xg.yhat.trn <- as.numeric(xg.yhat.trn > 0.25)
+
+xg.yhat <- predict(xg.pine, newdata = XGpine.tst, type = "response")
+xg.yhat <- as.numeric(xg.yhat > 0.25)
+
+mean(xg.yhat == fst.test$SPCD_pine)
+mean(xg.yhat.trn == fst.train$SPCD_pine)
+
+MLmetrics::F1_Score(factor(xg.yhat), factor(fst.test$SPCD_pine))
+MLmetrics::F1_Score(factor(xg.yhat.trn), factor(fst.train$SPCD_pine))
+```
+
+Plot predictions:
+
+```{r}
+xg.pine <- xgboost(data = XGpine.full,
+                    max.depth = 3, 
+                    eta = 0.5,
+                    nrounds =  10,
+                    
+                    ## control over fitting
+                    max_delta_step = 2,
+                    scale_pos_weight = 1.5,
+                    
+                    objective = "binary:logistic")
+
+## Make predictions on the prediction grid
+pine.preds <- predict(xg.pine, newdata = XG.predGrid, type = response)
+
+pine.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(pine.preds = ifelse(pine.preds>0.25, 1, 0))
+
+
+pine.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_pine) %>%
+  mutate(SPCD_pine = factor(SPCD_pine))
+
+pine.plot <- 
+ggplot(data = pine.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = pine.preds), interpolate = TRUE) +
+  scale_fill_gradient(low = 'white', high="darkgreen", guide = 'none') +
+  geom_point(data = pine.pts, aes(x = LON, y = LAT, color = SPCD_pine),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle('Predicted Lodgepole Pine Distribution')
+
+pine.plot
+```
+
+Get a list of variable importance:
+
+```{r}
+xgb.importance(model = xg.pine)
+```
+
+## Examining Oak
+
+Model fitting and prediction accuracy:
+
+```{r}
+xg.oak <- xgboost(data = XGoak.trn,
+                    max.depth = 5, 
+                    eta = 0.3,
+                    nrounds = 8,
+                    ## control over fitting
+                    max_delta_step = 2,
+                    scale_pos_weight = 1.5,
+                    objective = "binary:logistic")
+
+xg.yhat.trn <- predict(xg.oak, newdata = XGoak.trn, type = "response")
+xg.yhat.trn <- as.numeric(xg.yhat.trn > 0.35)
+
+xg.yhat <- predict(xg.oak, newdata = XGoak.tst, type = "response")
+xg.yhat <- as.numeric(xg.yhat > 0.35)
+
+mean(xg.yhat == fst.test$SPCD_oak)
+mean(xg.yhat.trn == fst.train$SPCD_oak)
+
+MLmetrics::F1_Score(factor(xg.yhat), factor(fst.test$SPCD_oak))
+MLmetrics::F1_Score(factor(xg.yhat.trn), factor(fst.train$SPCD_oak))
+```
+
+Plot predictions:
+
+```{r}
+xg.oak <- xgboost(data = XGoak.full,
+                    max.depth = 3, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    
+                    ## control over fitting
+                    max_delta_step = 2,
+                    scale_pos_weight = 1.5,
+                    
+                    objective = "binary:logistic")
+
+## Make predictions on the prediction grid
+oak.preds <- predict(xg.oak, newdata = XG.predGrid, type = response)
+
+oak.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(oak.preds = ifelse(oak.preds>0.35,1,0))
+
+
+oak.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_oak) %>%
+  mutate(SPCD_oak = factor(SPCD_oak))
+
+oak.plot <- 
+ggplot(data = oak.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = oak.preds), interpolate = TRUE) +
+  scale_fill_gradient(low= "white", high="darkgreen") +
+  geom_point(data = oak.pts, aes(x = LON, y = LAT, color = SPCD_oak),size = .2, alpha = 0.2)+
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle('Predicted Gambel Oak Distribution')
+
+oak.plot
+```
+
+Get a list of variable importance:
+
+```{r}
+xgb.importance(model = xg.oak)
+```
+
+## Examining FIR
+
+Model fitting and prediction accuracy:
+
+```{r}
+xg.fir <- xgboost(data = XGfir.tst,
+                    max.depth = 3, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    ## control over fitting
+                    max_delta_step = 3,
+                    scale_pos_weight = 1.5,
+                    objective = "binary:logistic")
+
+xg.yhat.trn <- predict(xg.fir, newdata = XGfir.trn, type = "response")
+xg.yhat.trn <- as.numeric(xg.yhat.trn > 0.35)
+
+xg.yhat <- predict(xg.fir, newdata = XGfir.tst, type = "response")
+xg.yhat <- as.numeric(xg.yhat > 0.35)
+
+mean(xg.yhat == fst.test$SPCD_fir)
+mean(xg.yhat.trn == fst.train$SPCD_fir)
+
+MLmetrics::F1_Score(factor(xg.yhat), factor(fst.test$SPCD_fir))
+MLmetrics::F1_Score(factor(xg.yhat.trn), factor(fst.train$SPCD_fir))
+```
+
+Plot predictions:
+
+```{r}
+xg.fir <- xgboost(data = XGfir.full,
+                    max.depth = 3, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    
+                    ## control over fitting
+                    max_delta_step = 3,
+                    scale_pos_weight = 1.5,
+                    
+                    objective = "binary:logistic")
+
+## Make predictions on the prediction grid
+fir.preds <- predict(xg.fir, newdata = XG.predGrid, type = response)
+
+fir.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(fir.preds = ifelse(fir.preds>0.35, 1, 0))
+
+
+fir.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_fir) %>%
+  mutate(SPCD_fir = factor(SPCD_fir))
+
+fir.plot <- 
+ggplot(data = fir.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = fir.preds), interpolate = TRUE) +
+  scale_fill_gradient(low= "white", high="darkgreen", guide = 'none') +
+  geom_point(data = fir.pts, aes(x = LON, y = LAT, color = SPCD_fir),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle('Predicted Subalpine Fir Distribution')
+
+
+fir.plot
+```
+
+Get a list of variable importance:
+
+```{r}
+xgb.importance(model = xg.fir)
+```
+
+Make a nice looking plot of spruce, pine and fir distribution plots:
+
+```{r, fig.width=12}
+ggpubr::ggarrange(aspen.plot, spruce.plot, pine.plot, fir.plot, 
+                  ncol = 2, nrow = 2, 
+                  common.legend = TRUE,
+                  legend = 'bottom')
+```
+
+
+
+## Modeling distribution given a change in DIFS
+
+```{r}
+## sequence of different difference in summer temperatures
+difs.offset <- seq(from = mean(pred.grid$DIFS) - 2*sd(fst.df$DIFS),
+                   to = mean(pred.grid$DIFS) + 2*sd(fst.df$DIFS),
+                   length.out = 100)
+
+pine.ratio <- 1:length(difs.offset)
+difs.pred <- pred.grid$DIFS #make a copy of original prediction
+
+## current total number of squares filled as denominator
+denom.pine <- sum(pine.pred.grid$pine.preds)
+
+
+for (i in 1:length(difs.offset)){
+  pine.preds.difs <- 0
+  ## make xg prediction grid and add offset
+  XG.gridAlt <- xgb.DMatrix(data = as.matrix(pred.grid %>%
+                                               select(-c(LON,LAT)) %>%
+                                               mutate(DIFS = difs.pred + difs.offset[i])))
+  
+  pine.preds.difs <- ifelse(predict(xg.pine, newdata = XG.gridAlt, type = response) > 0.25, 1,0)
+  
+  pred.grid.tmp <- pred.grid %>% mutate(pine.preds.difs = 
+                                          ifelse(predict(xg.pine, newdata = 
+                                                           XG.gridAlt, type = response) > 0.25, 
+                                                 1,0)) %>%
+    filter(ELEV >= (7000 - mean(forest.df$ELEV))/sd(forest.df$ELEV))
+  
+  pine.ratio[i] = sum(pred.grid.tmp$pine.preds.difs) / denom.pine
+  
+}
+
+pine.change <- data.frame(DDIFS = difs.offset, DIST_RATIO = pine.ratio)
+
+ggplot(data = pine.change, aes(x = DDIFS, y = DIST_RATIO)) + geom_point() + geom_line()
+```
+
+Calculate the actual temperature difference:
+
+```{r}
+sd(forest.df$DIFS) 
+```
+
+
+Distribution for 1-SD decrease in DIFS:
+
+```{r}
+XG.gridAlt <- xgb.DMatrix(data = as.matrix(pred.grid %>%
+                                               select(-c(LON,LAT)) %>%
+                                               mutate(DIFS = difs.pred - 1)))
+
+## Make predictions on the prediction grid
+pine.preds <- predict(xg.pine, newdata = XG.gridAlt, type = response)
+
+pine.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(pine.preds = ifelse(pine.preds>0.25, 1, 0))
+
+
+pine.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_pine) %>%
+  mutate(SPCD_pine = factor(SPCD_pine))
+
+pine.plot.dec <- 
+ggplot(data = pine.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = pine.preds), interpolate = TRUE) +
+  scale_fill_gradient(low = 'white', high="darkgreen", guide = 'none') +
+  geom_point(data = pine.pts, aes(x = LON, y = LAT, color = SPCD_pine),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle('Decrease in DIFS Pine Distribution')
+
+pine.plot.dec
+```
+
+Distribution for 1-SD increase in DIFS:
+
+```{r}
+XG.gridAlt <- xgb.DMatrix(data = as.matrix(pred.grid %>%
+                                               select(-c(LON,LAT)) %>%
+                                               mutate(DIFS = difs.pred + 1 )))
+
+## Make predictions on the prediction grid
+pine.preds <- predict(xg.pine, newdata = XG.gridAlt, type = response)
+
+pine.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(pine.preds = ifelse(pine.preds>0.5, 1, 0))
+
+
+pine.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_pine) %>%
+  mutate(SPCD_pine = factor(SPCD_pine))
+
+pine.plot.inc <- 
+ggplot(data = pine.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = pine.preds), interpolate = TRUE) +
+  scale_fill_gradient(low = 'white', high="darkgreen", guide = 'none') +
+  geom_point(data = pine.pts, aes(x = LON, y = LAT, color = SPCD_pine),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle('Increase in DIFS Pine Distribution')
+
+pine.plot.inc
+```
+
+Final plot:
+
+```{r, fig.width=12}
+ggpubr::ggarrange(pine.plot.dec, pine.plot.inc,
+                  ncol = 2, nrow = 1, 
+                  common.legend = TRUE,
+                  legend = 'right')
+```
+
+
+
+Let's do something similar for fir by manipulating VARA:
+
+Decrease in VARA:
+
+```{r}
+vara.pred <- pred.grid$VARA #make a copy of original prediction
+
+XG.gridAlt <- xgb.DMatrix(data = as.matrix(pred.grid %>%
+                                               select(-c(LON,LAT)) %>%
+                                               mutate(VARA = vara.pred - 1)))
+
+## Make predictions on the prediction grid
+fir.preds <- predict(xg.fir, newdata = XG.gridAlt, type = response)
+
+fir.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(fir.preds = ifelse(fir.preds>0.35, 1, 0))
+
+
+fir.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_fir) %>%
+  mutate(SPCD_fir = factor(SPCD_fir))
+
+fir.plot.dec <- 
+ggplot(data = fir.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = fir.preds), interpolate = TRUE) +
+  scale_fill_gradient(low = 'white', high="darkgreen", guide = 'none') +
+  geom_point(data = fir.pts, aes(x = LON, y = LAT, color = SPCD_fir),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle('Decrease in VARA fir Distribution')
+
+fir.plot.dec
+
+```
+
+Increase in VAR for fir:
+
+```{r}
+XG.gridAlt <- xgb.DMatrix(data = as.matrix(pred.grid %>%
+                                               select(-c(LON,LAT)) %>%
+                                               mutate(VARA = vara.pred + 1)))
+
+## Make predictions on the prediction grid
+fir.preds <- predict(xg.fir, newdata = XG.gridAlt, type = response)
+
+fir.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(fir.preds = ifelse(fir.preds>0.35, 1, 0))
+
+
+fir.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_fir) %>%
+  mutate(SPCD_fir = factor(SPCD_fir))
+
+fir.plot.inc <- 
+ggplot(data = fir.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = fir.preds), interpolate = TRUE) +
+  scale_fill_gradient(low = 'white', high="darkgreen", guide = 'none') +
+  geom_point(data = fir.pts, aes(x = LON, y = LAT, color = SPCD_fir),size = .4, alpha = 1) +
+  scale_color_discrete(name = "Observed", labels = c("Absent", "Present")) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  ggtitle('Increase in VARA fir Distribution')
+
+fir.plot.inc
+
+```
+
+Final plot:
+
+```{r, fig.width=12}
+ggpubr::ggarrange(fir.plot.dec, fir.plot.inc,
+                  ncol = 2, nrow = 1, 
+                  common.legend = TRUE,
+                  legend = 'right')
+```
+
+
+## Pine & Fir Abundance with a Tweedie Response
+
+Create a new data-frame and XG matrices:
+
+
+```{r}
+## Create new data frame with species counts and relavent variables
+
+abundance.df <- fst.df %>%
+  select(-c(LAT, LON, SPCD_aspen:SPCD_pine)) %>%
+  mutate(SPCD_pine = forest.df$SPCD_108,
+         SPCD_fir = forest.df$SPCD_19)
+
+## Split into test and training
+set.seed(231)
+num.obsA <- dim(abundance.df)[1]
+split.pctA <- 0.8
+trn.indexA <- sample(1:num.obs, round(split.pctA*num.obsA))
+
+abundance.train <- as.data.frame(abundance.df[ trn.indexA,])
+abundance.test  <- as.data.frame(abundance.df[-trn.indexA,])
+
+## Pine boosting matrices
+
+## LODGEPOLE PINE
+
+XGApine.trn <- xgb.DMatrix(data  = as.matrix(abundance.train %>% 
+                                              select(ELEV:PPTW)),
+                           label = as.matrix(abundance.train$SPCD_pine))
+
+XGApine.tst <- xgb.DMatrix(data  = as.matrix(abundance.test %>% 
+                                              select(ELEV:PPTW)),
+                           label = as.matrix(abundance.test$SPCD_pine))
+
+XGApine.full <- xgb.DMatrix(data  = as.matrix(abundance.df %>% 
+                                               select(ELEV:PPTW)),
+                           label  = as.matrix(abundance.df$SPCD_pine))
+
+## Subalpine fir
+
+XGAfir.trn <- xgb.DMatrix(data  = as.matrix(abundance.train %>% 
+                                              select(ELEV:PPTW)),
+                           label = as.matrix(abundance.train$SPCD_fir))
+
+XGAfir.tst <- xgb.DMatrix(data  = as.matrix(abundance.test %>% 
+                                              select(ELEV:PPTW)),
+                           label = as.matrix(abundance.test$SPCD_fir))
+
+XGAfir.full <- xgb.DMatrix(data  = as.matrix(abundance.df %>% 
+                                               select(ELEV:PPTW)),
+                           label  = as.matrix(abundance.df$SPCD_fir))
+```
+
+Count number of zero responses:
+
+```{r}
+abundance.df %>% select(SPCD_pine) %>% filter(SPCD_pine > 0) %>% count() / dim(abundance.df)[1]
+```
+
+
+
+Modify the cross-validation function for Tweedie regression:
+
+```{r}
+xg.optimizeT <- function(XG.trn, depth.seq, eta.seq, nround = 4, cv.folds = 10){
+  
+  ## create search grid
+  search.grid <- cbind(expand.grid(depth = depth.seq, 
+                                   eta = eta.seq),
+                       train.loglik = 1:(length(depth.seq)*length(eta.seq)),
+                       test.loglik = 1:(length(depth.seq)*length(eta.seq)))
+  
+  ## begin iterations
+  for (i in 1:dim(search.grid)[1]){
+    
+    ## use xg cross-validation function 
+    t <- xgb.cv(data = XG.trn,
+                
+                ## Paramaters to be optimized
+                max.depth = search.grid$depth[i], 
+                eta = search.grid$eta[i],
+                
+                ## folds and rounds
+                nfold = cv.folds,
+                nrounds = nround,
+                
+                ## control over fitting
+                max_delta_step = 2,
+                scale_pos_weight = 1.5,
+                sub_sample = 0.8,
+                
+                ## objective to optimize
+                stratified = TRUE,
+                metrics = "tweedie-nloglik@1.5",
+                objective = "reg:tweedie",
+              
+                ## quiet output
+                verbose = 0)
+    
+    ## put auc value in the search grid
+    result.train <- t$evaluation_log$`train_tweedie_nloglik@1.5_mean`
+    result.test <- t$evaluation_log$`test_tweedie_nloglik@1.5_mean`
+
+    search.grid$train.loglik[i] <- result.train[length(result.train)]
+    search.grid$test.loglik[i] <- result.test[length(result.test)]
+    
+    print(paste("Iteration #: ", i))
+    
+    }
+  
+  ## return search values
+  return(search.grid)
+
+}
+```
+
+
+
+## Pine Abundance
+
+```{r, eval = F}
+a.depth <- c(2,3,4,6,8,10)
+a.eta <- c(0.1,0.3,0.5,1)
+
+pine.optim <- xg.optimizeT(XG.trn = XGApine.trn,
+                          cv.folds = 10,
+                          nround = 10,
+                          depth.seq = a.depth,
+                          eta.seq = a.eta)
+
+pine.optim
+```
+
+
+Model fitting and prediction accuracy:
+
+```{r}
+xgA.pine <- xgboost(data = XGApine.trn,
+                    max.depth = 3, 
+                    eta = 0.1,
+                    nrounds = 10,
+                    ## control over fitting
+                    max_delta_step = 2,
+                    tweedie_variance_power = 1.5,
+                    objective = "reg:tweedie")
+
+
+xg.yhat.trn <- predict(xgA.pine, newdata = XGApine.trn, type = "response")
+xg.yhat <- predict(xg.pine, newdata = XGApine.tst, type = "response")
+
+mean((abundance.train$SPCD_pine - xg.yhat.trn)^2)
+mean((abundance.test$SPCD_pine - xg.yhat)^2)
+```
+
+```{r}
+xgA.pine <- xgboost(data = XGApine.full,
+                    max.depth = 3, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    ## control over fitting
+                    max_delta_step = 2,
+                    tweedie_variance_power = 1.5,
+                    objective = "reg:tweedie")
+
+## Make predictions on the prediction grid
+pineA.preds <- predict(xgA.pine, newdata = XG.predGrid, type = response)
+
+pineA.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(pine.preds = pineA.preds)
+
+
+pine.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_pine) %>%
+  mutate(SPCD_pine = factor(SPCD_pine))
+
+pine.abund.plot <- 
+ggplot(data = pineA.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = pine.preds), interpolate = TRUE) +
+  scale_fill_gradient(low= "white", high="darkgreen", name = "Pine Abundance") +
+  geom_point(data = pine.pts, aes(x = LON, y = LAT, color = SPCD_pine),size = .2, alpha = 0.3) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) + 
+  scale_color_discrete(name = "Observed Pine", labels = c("Absent", "Present")) +
+  ggtitle("Predicted Lodgepole Pine Abundance") +
+  guides(fill = guide_colorbar(order = 1), color = guide_legend(order= 0))
+ 
+pine.abund.plot 
+```
+
+```{r}
+xgb.importance(model = xgA.pine)
+```
+
+## Fir Abundance
+
+```{r, eval = F}
+a.depth <- c(3,4,6,8,10)
+a.eta <- c(0.1,0.3,0.5,1)
+
+fir.optim <- xg.optimizeT(XG.trn = XGAfir.trn,
+                          cv.folds = 10,
+                          nround = 10,
+                          depth.seq = a.depth,
+                          eta.seq = a.eta)
+
+fir.optim
+```
+
+
+
+Model fitting and prediction accuracy:
+
+```{r}
+xgA.fir <- xgboost(data = XGAfir.trn,
+                    max.depth = 3, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    ## control over fitting
+                    max_delta_step = 2,
+                    tweedie_variance_power = 1.5,
+                    objective = "reg:tweedie")
+
+
+xg.yhat.trn <- predict(xgA.fir, newdata = XGAfir.trn, type = "response")
+xg.yhat <- predict(xg.fir, newdata = XGAfir.tst, type = "response")
+
+mean((abundance.train$SPCD_fir - xg.yhat.trn)^2)
+mean((abundance.test$SPCD_fir - xg.yhat)^2)
+```
+
+
+Prediction and map:
+
+```{r}
+xgA.fir <- xgboost(data = XGAfir.full,
+                    max.depth = 3, 
+                    eta = 0.3,
+                    nrounds = 10,
+                    ## control over fitting
+                    max_delta_step = 2,
+                    tweedie_variance_power = 1.5,
+                    objective = "reg:tweedie")
+
+## Make predictions on the prediction grid
+firA.preds <- predict(xgA.fir, newdata = XG.predGrid, type = response)
+
+firA.pred.grid <- pred.grid %>% select(LAT, LON) %>% mutate(fir.preds = firA.preds)
+
+
+fir.pts <-  fst.df %>%
+  select(LON, LAT, SPCD_fir) %>%
+  mutate(SPCD_fir = factor(SPCD_fir))
+
+fir.abund.plot <- 
+ggplot(data = firA.pred.grid, aes(x = LON, y = LAT)) + 
+  geom_raster(aes(fill = fir.preds), interpolate = TRUE) +
+  scale_fill_gradient(low= "white", high="darkgreen", name = 'Fir Abundance') +
+  geom_point(data = fir.pts, aes(x = LON, y = LAT, color = SPCD_fir),size = .2, alpha = 0.3) +
+  borders("county","colorado",colour="grey70") + 
+  borders("state", size = 2) +
+  scale_x_continuous(breaks = seq(from = -109.5, to = 101.25, by = 1)) +
+  coord_fixed(ratio = 1.25, xlim = c(-108.95,-102.2), ylim = c(37,41.1)) +
+  scale_color_discrete(name = "Observed Fir", labels = c("Absent", "Present")) +
+  ggtitle("Predicted Subalpine Fir Abundance") +
+  guides(fill = guide_colorbar(order = 1), color = guide_legend(order= 0))
+
+
+fir.abund.plot
+```
+
+
+```{r}
+xgb.importance(model = xgA.fir)
+```
+
+
+
+Final plot:
+
+```{r, fig.width=12}
+ggpubr::ggarrange(pine.abund.plot, fir.abund.plot,
+                  ncol = 2, nrow = 1)
+```
+
+
+
+
